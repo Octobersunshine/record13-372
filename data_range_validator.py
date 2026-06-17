@@ -1,7 +1,41 @@
 import pandas as pd
 from typing import Dict, List, Any, Optional, Union
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, date
+
+
+def _is_date_like(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, (datetime, date, pd.Timestamp)):
+        return True
+    if isinstance(value, str):
+        try:
+            pd.to_datetime(value)
+            return True
+        except (ValueError, TypeError):
+            return False
+    return False
+
+
+def _to_timestamp(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        ts = pd.to_datetime(value)
+        return ts.timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
+def _series_to_timestamp(series: pd.Series) -> Optional[pd.Series]:
+    try:
+        dt_series = pd.to_datetime(series, errors="coerce")
+        if dt_series.isna().all():
+            return None
+        return dt_series.apply(lambda x: x.timestamp() if pd.notna(x) else None)
+    except (ValueError, TypeError):
+        return None
 
 
 @dataclass
@@ -13,23 +47,49 @@ class RangeRule:
     include_min: bool = True
     include_max: bool = True
 
+    def _is_date_comparison(self, series: pd.Series) -> bool:
+        has_date_boundary = _is_date_like(self.min_value) or _is_date_like(self.max_value)
+        if has_date_boundary:
+            return True
+        if pd.api.types.is_datetime64_any_dtype(series):
+            return True
+        sample = series.dropna().head(5)
+        if len(sample) > 0 and all(_is_date_like(v) for v in sample):
+            return True
+        return False
+
     def validate(self, series: pd.Series) -> pd.Series:
         mask = pd.Series(True, index=series.index)
 
         if self.allowed_values is not None:
             mask = mask & series.isin(self.allowed_values)
 
-        if self.min_value is not None:
-            if self.include_min:
-                mask = mask & (series >= self.min_value)
-            else:
-                mask = mask & (series > self.min_value)
+        use_timestamp = self._is_date_comparison(series)
 
-        if self.max_value is not None:
-            if self.include_max:
-                mask = mask & (series <= self.max_value)
+        if use_timestamp:
+            series_ts = _series_to_timestamp(series)
+            min_ts = _to_timestamp(self.min_value)
+            max_ts = _to_timestamp(self.max_value)
+
+            compare_series = series_ts if series_ts is not None else series
+            compare_min = min_ts if min_ts is not None else self.min_value
+            compare_max = max_ts if max_ts is not None else self.max_value
+        else:
+            compare_series = series
+            compare_min = self.min_value
+            compare_max = self.max_value
+
+        if compare_min is not None:
+            if self.include_min:
+                mask = mask & (compare_series >= compare_min)
             else:
-                mask = mask & (series < self.max_value)
+                mask = mask & (compare_series > compare_min)
+
+        if compare_max is not None:
+            if self.include_max:
+                mask = mask & (compare_series <= compare_max)
+            else:
+                mask = mask & (compare_series < compare_max)
 
         return ~mask
 
