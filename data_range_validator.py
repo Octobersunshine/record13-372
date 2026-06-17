@@ -58,12 +58,7 @@ class RangeRule:
             return True
         return False
 
-    def validate(self, series: pd.Series) -> pd.Series:
-        mask = pd.Series(True, index=series.index)
-
-        if self.allowed_values is not None:
-            mask = mask & series.isin(self.allowed_values)
-
+    def _prepare_compare_values(self, series: pd.Series):
         use_timestamp = self._is_date_comparison(series)
 
         if use_timestamp:
@@ -79,19 +74,40 @@ class RangeRule:
             compare_min = self.min_value
             compare_max = self.max_value
 
+        return compare_series, compare_min, compare_max
+
+    def validate_detail(self, series: pd.Series) -> Dict[str, pd.Series]:
+        details = {
+            "below_min": pd.Series(False, index=series.index),
+            "above_max": pd.Series(False, index=series.index),
+            "not_in_allowed": pd.Series(False, index=series.index),
+        }
+
+        compare_series, compare_min, compare_max = self._prepare_compare_values(series)
+
+        if self.allowed_values is not None:
+            details["not_in_allowed"] = ~series.isin(self.allowed_values)
+
         if compare_min is not None:
             if self.include_min:
-                mask = mask & (compare_series >= compare_min)
+                details["below_min"] = compare_series < compare_min
             else:
-                mask = mask & (compare_series > compare_min)
+                details["below_min"] = compare_series <= compare_min
 
         if compare_max is not None:
             if self.include_max:
-                mask = mask & (compare_series <= compare_max)
+                details["above_max"] = compare_series > compare_max
             else:
-                mask = mask & (compare_series < compare_max)
+                details["above_max"] = compare_series >= compare_max
 
-        return ~mask
+        return details
+
+    def validate(self, series: pd.Series) -> pd.Series:
+        details = self.validate_detail(series)
+        combined = pd.Series(False, index=series.index)
+        for mask in details.values():
+            combined = combined | mask
+        return combined
 
 
 @dataclass
@@ -101,16 +117,116 @@ class ValidationResult:
     invalid_rows_count: int
     invalid_rows: pd.DataFrame
     violations: Dict[str, pd.Series] = field(default_factory=dict)
+    violation_details: Dict[str, Dict[str, pd.Series]] = field(default_factory=dict)
+    rules: List[RangeRule] = field(default_factory=list)
+
+    def _get_rule_by_column(self, column: str) -> Optional[RangeRule]:
+        for rule in self.rules:
+            if rule.column == column:
+                return rule
+        return None
+
+    def violation_statistics(self) -> pd.DataFrame:
+        rows = []
+        for col, total_mask in self.violations.items():
+            total = int(total_mask.sum())
+            if total == 0:
+                continue
+
+            details = self.violation_details.get(col, {})
+            below_min = int(details.get("below_min", pd.Series(dtype=bool)).sum())
+            above_max = int(details.get("above_max", pd.Series(dtype=bool)).sum())
+            not_in_allowed = int(details.get("not_in_allowed", pd.Series(dtype=bool)).sum())
+
+            rule = self._get_rule_by_column(col)
+            min_val = rule.min_value if rule else None
+            max_val = rule.max_value if rule else None
+
+            rows.append({
+                "column": col,
+                "total_violations": total,
+                "violation_rate": f"{total / self.total_rows * 100:.2f}%",
+                "below_min": below_min,
+                "above_max": above_max,
+                "not_in_allowed": not_in_allowed,
+                "min_value": str(min_val) if min_val is not None else "-",
+                "max_value": str(max_val) if max_val is not None else "-",
+            })
+
+        if not rows:
+            return pd.DataFrame(columns=[
+                "column", "total_violations", "violation_rate",
+                "below_min", "above_max", "not_in_allowed",
+                "min_value", "max_value"
+            ])
+
+        df = pd.DataFrame(rows)
+        df = df.sort_values("total_violations", ascending=False).reset_index(drop=True)
+        return df
 
     def summary(self) -> Dict[str, Any]:
+        stats = self.violation_statistics()
         return {
             "is_valid": self.is_valid,
             "total_rows": self.total_rows,
             "invalid_rows_count": self.invalid_rows_count,
+            "invalid_rate": f"{self.invalid_rows_count / self.total_rows * 100:.2f}%" if self.total_rows > 0 else "0.00%",
             "violations_by_column": {
                 col: int(viol.sum()) for col, viol in self.violations.items()
             },
+            "violation_details": stats.to_dict(orient="records") if not stats.empty else [],
         }
+
+    def statistics_report(self) -> str:
+        stats_df = self.violation_statistics()
+
+        lines = [
+            "=" * 70,
+            "范围违规统计报告",
+            "=" * 70,
+            f"总行数: {self.total_rows}",
+            f"异常行数: {self.invalid_rows_count}",
+            f"异常率: {self.invalid_rows_count / self.total_rows * 100:.2f}%" if self.total_rows > 0 else "异常率: 0.00%",
+            f"涉及字段数: {len(stats_df)}",
+            "",
+        ]
+
+        if stats_df.empty:
+            lines.append("✓ 所有数据均在正常范围内")
+        else:
+            lines.append("各字段违规详情 (按违规数降序):")
+            lines.append("-" * 70)
+
+            col_width = max(len("字段"), max(len(c) for c in stats_df["column"])) + 2
+            lines.append(
+                f"{'字段'.ljust(col_width)}"
+                f"{'违规数'.rjust(8)}"
+                f"{'违规率'.rjust(10)}"
+                f"{'低于下限'.rjust(10)}"
+                f"{'超出上限'.rjust(10)}"
+                f"{'不在允许值'.rjust(12)}"
+            )
+            lines.append("-" * 70)
+
+            for _, row in stats_df.iterrows():
+                lines.append(
+                    f"{str(row['column']).ljust(col_width)}"
+                    f"{str(row['total_violations']).rjust(8)}"
+                    f"{str(row['violation_rate']).rjust(10)}"
+                    f"{str(row['below_min']).rjust(10)}"
+                    f"{str(row['above_max']).rjust(10)}"
+                    f"{str(row['not_in_allowed']).rjust(12)}"
+                )
+
+            lines.append("-" * 70)
+            lines.append("")
+            lines.append("各字段范围定义:")
+            for _, row in stats_df.iterrows():
+                lines.append(f"  {row['column']}: [{row['min_value']}, {row['max_value']}]")
+
+        lines.append("")
+        lines.append("=" * 70)
+        return "\n".join(lines)
 
     def detailed_report(self) -> str:
         lines = [
@@ -128,7 +244,8 @@ class ValidationResult:
             for col, viol in self.violations.items():
                 count = int(viol.sum())
                 if count > 0:
-                    lines.append(f"  - {col}: {count} 行超出范围")
+                    pct = count / self.total_rows * 100 if self.total_rows > 0 else 0
+                    lines.append(f"  - {col}: {count} 行超出范围 ({pct:.2f}%)")
 
         if not self.invalid_rows.empty:
             lines.append("")
@@ -173,14 +290,21 @@ class DataRangeValidator:
 
     def validate(self, df: pd.DataFrame) -> ValidationResult:
         violations: Dict[str, pd.Series] = {}
+        violation_details: Dict[str, Dict[str, pd.Series]] = {}
         combined_mask = pd.Series(False, index=df.index)
 
         for rule in self.rules:
             if rule.column not in df.columns:
                 raise ValueError(f"列 '{rule.column}' 不存在于数据中")
 
-            viol_mask = rule.validate(df[rule.column])
+            detail_masks = rule.validate_detail(df[rule.column])
+            violation_details[rule.column] = detail_masks
+
+            viol_mask = pd.Series(False, index=df.index)
+            for mask in detail_masks.values():
+                viol_mask = viol_mask | mask
             violations[rule.column] = viol_mask
+
             combined_mask = combined_mask | viol_mask
 
         invalid_rows = df[combined_mask].copy()
@@ -193,6 +317,8 @@ class DataRangeValidator:
             invalid_rows_count=int(combined_mask.sum()),
             invalid_rows=invalid_rows,
             violations=violations,
+            violation_details=violation_details,
+            rules=self.rules,
         )
 
     def filter_valid(self, df: pd.DataFrame) -> pd.DataFrame:

@@ -116,8 +116,44 @@ def example_with_rule_objects():
     print()
 
 
+def example_statistics_report():
+    print("=" * 70)
+    print("示例5: 范围违规统计报告")
+    print("=" * 70)
+
+    df = create_sample_data()
+
+    validator = DataRangeValidator()
+    validator.add_rule(column="age", min_value=18, max_value=100)
+    validator.add_rule(column="score", min_value=0, max_value=100)
+    validator.add_rule(column="salary", min_value=30000, max_value=1000000)
+    validator.add_rule(column="grade", allowed_values=["A", "B", "C", "D", "F"])
+    validator.add_rule(
+        column="register_date",
+        min_value=pd.Timestamp("2021-01-01"),
+        max_value=pd.Timestamp("2024-12-31"),
+    )
+
+    result = validator.validate(df)
+
+    print(result.statistics_report())
+    print()
+
+    print("violation_statistics() 返回 DataFrame:")
+    stats_df = result.violation_statistics()
+    print(stats_df.to_string(index=False))
+    print()
+
+    print("summary() 中的详细统计:")
+    summary = result.summary()
+    import json
+    print(json.dumps(summary["violation_details"], indent=2, ensure_ascii=False))
+    print()
+
+
 if __name__ == "__main__":
     example_basic_usage()
     example_dict_config()
     example_filter_valid()
     example_with_rule_objects()
+    example_statistics_report()
